@@ -119,8 +119,8 @@ end)
 --====================================================
 
 local MOB_FOLDER = workspace:WaitForChild("Mobs")
-local HEIGHT = 70
-local DISTANCE_MOB = 40
+local HEIGHT = 100
+local DISTANCE_MOB = 70
 local ROTATION_SPEED = 3
 local SAFE_HEIGHT = 2000
 
