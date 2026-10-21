@@ -453,7 +453,7 @@ local rootPart =
 
 local mobToFollow = nil
 
-local TARGET_SPEED = 80
+local TARGET_SPEED = 10000
 
 local flyVelocity = nil
 
