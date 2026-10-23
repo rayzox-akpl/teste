@@ -4,9 +4,15 @@
 -- Le toggle les execute tels quels et les relance au retry.
 -- ==========================================================
 
-local REPO = "https://raw.githubusercontent.com/rayzox-akpl/teste/main/"
+-- >>> LA SEULE LIGNE A CHANGER : "pseudo/nom-du-depot" de ton GitHub <<<
+local GITHUB = "rayzox-akpl/teste"
+local BRANCH = "main"
+local REPO = "https://raw.githubusercontent.com/" .. GITHUB .. "/" .. BRANCH .. "/"
 local HUB_NAME = "Hub"
-local HUB_VERSION = "v2 (minigun + invaded)"
+local HUB_VERSION = "v3.3"
+-- Le hub ne se ferme JAMAIS tout seul (ni minuterie, ni ecran Start/Retry).
+-- Mets true pour retrouver la fermeture automatique.
+local AUTO_CLOSE = false
 
 --====================================================
 -- LISTE DES SCRIPTS
@@ -29,39 +35,98 @@ local Scripts = {
 }
 
 --====================================================
--- ETAT PERSISTANT
+-- ETAT PERSISTANT (3 couches, la plus fiable gagne)
+--   1. etat injecte dans le code relance au teleport (aucun fichier)
+--   2. fichier hub_state_v2.json (writefile / readfile)
+--   3. _G (meme serveur uniquement)
 --====================================================
 
--- Persistance par fichier : _G est detruit au changement de serveur
-local STATE_FILE = "hub_state.json"
 local HttpService = game:GetService("HttpService")
+local TeleportPlayer = game:GetService("Players").LocalPlayer
+
+-- Relance apres teleport : queue_on_teleport nous rappelle avec
+-- _G.HubBoot (l'etat), _G.HubFromTeleport et _G.HubBootStamp.
+local BOOT = _G.HubBoot
+local FROM_TP = _G.HubFromTeleport
+local STAMP = _G.HubBootStamp
+_G.HubBoot, _G.HubFromTeleport, _G.HubBootStamp = nil, nil, nil
+
+if FROM_TP then
+    local job = game.JobId
+    if _G.HubBootJob == job then
+        -- Deja charge dans ce serveur : on ne garde que la copie la plus recente
+        if (STAMP or 0) <= (_G.HubBootStamp2 or 0) then return end
+    else
+        -- Nouveau serveur : les scripts de l'ancien sont morts
+        _G.HubLaunched = {}
+    end
+    _G.HubBootJob = job
+    _G.HubBootStamp2 = STAMP or 0
+end
+
+local STATE_FILES = { "hub_state_v2.json", "hub_state.json" }
+local DIAG = "?"
+local hintLabel, hintBase = nil, ""
+
+local function setDiag(text)
+    DIAG = text
+    if hintLabel then hintLabel.Text = hintBase .. " - " .. DIAG end
+end
+
+local function decodeState(str)
+    if type(str) ~= "string" then return nil end
+    local ok, d = pcall(function() return HttpService:JSONDecode(str) end)
+    if ok and type(d) == "table" and type(d.enabled) == "table" then
+        return d
+    end
+    return nil
+end
 
 local function loadState()
-    if isfile and readfile and isfile(STATE_FILE) then
-        local ok, data = pcall(function()
-            return HttpService:JSONDecode(readfile(STATE_FILE))
-        end)
-        if ok and type(data) == "table" and type(data.enabled) == "table" then
-            return data
+    -- couche 1 : etat injecte au teleport
+    if BOOT then
+        local d = decodeState(BOOT)
+        if d then DIAG = "etat recu (teleport)" return d end
+    end
+    -- couche 2 : fichiers
+    if isfile and readfile then
+        for _, f in ipairs(STATE_FILES) do
+            local ok, content = pcall(function()
+                if isfile(f) then return readfile(f) end
+            end)
+            if ok and content then
+                local d = decodeState(content)
+                if d then DIAG = "etat lu (fichier)" return d end
+            end
         end
     end
+    DIAG = "aucun etat sauvegarde"
     return { enabled = {} }
 end
 
 local function saveState(state)
-    if writefile then
-        pcall(function()
-            writefile(STATE_FILE, HttpService:JSONEncode({ enabled = state.enabled }))
-        end)
+    _G.HubState = state
+    if not writefile then
+        setDiag("pas de writefile (teleport seul)")
+        return
     end
+    local ok, err = pcall(function()
+        writefile(STATE_FILES[1], HttpService:JSONEncode({ enabled = state.enabled }))
+    end)
+    setDiag(ok and "sauvegarde OK" or ("erreur fichier: " .. tostring(err)))
 end
 
-_G.HubState = _G.HubState or loadState()
+-- BOOT gagne toujours (sinon un _G perime d'un ancien serveur pourrait
+-- ecraser l'etat). Sans BOOT : _G, puis fichier.
+_G.HubState = (BOOT and loadState()) or _G.HubState or loadState()
 local State = _G.HubState
 
 -- Scripts deja lances dans CETTE session (survit au retry, pas au teleport)
 _G.HubLaunched = _G.HubLaunched or {}
 local Launched = _G.HubLaunched
+
+-- On remet le fichier a jour des le demarrage (migration + verification)
+saveState(State)
 
 if _G.HubGui then
     pcall(function() _G.HubGui:Destroy() end)
@@ -73,13 +138,35 @@ _G.HubSession = (_G.HubSession or 0) + 1
 local SESSION = _G.HubSession
 print("[HUB] Session " .. SESSION .. " -- version " .. HUB_VERSION .. ", " .. #Scripts .. " scripts")
 
--- ?v=os.time() : GitHub (et certains executors) gardent l'ancienne
--- version du fichier en cache plusieurs minutes. Avec un numero qui
--- change a chaque fois, on recupere toujours la derniere version poussee.
-if queue_on_teleport then
-    queue_on_teleport('loadstring(game:HttpGet("' .. REPO
-        .. 'hub.lua?v=" .. tostring(os.time())))()')
+-- Relance du hub apres teleport, AVEC l'etat dedans (%q echappe la chaine).
+-- Le numero de version (?v=) evite le cache de GitHub.
+local function queueBoot(why)
+    if not queue_on_teleport then return end
+    local ok, err = pcall(function()
+        local json = HttpService:JSONEncode({ enabled = State.enabled })
+        local code = string.format(
+            '_G.HubBoot = %q; _G.HubFromTeleport = true; _G.HubBootStamp = %.3f; '
+            .. 'loadstring(game:HttpGet(%q .. tostring(os.time())))()',
+            json, tick(), REPO .. "hub.lua?v=")
+        queue_on_teleport(code)
+    end)
+    print("[HUB] queue_on_teleport (" .. why .. ") : " .. (ok and "ok" or tostring(err)))
 end
+
+-- Filet de securite si le teleport n'annonce rien
+if _G.HubStartQueued ~= game.JobId then
+    _G.HubStartQueued = game.JobId
+    queueBoot("demarrage")
+end
+
+-- Au moment du teleport : on met en file l'etat LE PLUS RECENT
+local teleportQueued = false
+TeleportPlayer.OnTeleport:Connect(function(tpState)
+    if tpState == Enum.TeleportState.Failed then return end
+    if teleportQueued then return end
+    teleportQueued = true
+    queueBoot("teleport")
+end)
 
 --====================================================
 -- SERVICES
@@ -92,6 +179,15 @@ local StarterGui = game:GetService("StarterGui")
 local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
+
+-- Telephone : ecran tactile sans clavier (Delta mobile...). Le hub devient
+-- petit, se range dans un bouton flottant, et s'efface pendant l'ecran de
+-- fin pour ne jamais recouvrir Retry. FORCE_MOBILE = true/false pour forcer.
+local FORCE_MOBILE = nil
+local MOBILE = FORCE_MOBILE
+if MOBILE == nil then
+    MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+end
 
 --====================================================
 -- EXECUTION D'UN SCRIPT
@@ -261,7 +357,10 @@ hint.BackgroundTransparency = 1
 hint.Font = Enum.Font.Gotham
 hint.TextSize = 11
 hint.TextColor3 = Color3.fromRGB(120, 122, 145)
-hint.Text = "RightCtrl pour cacher"
+hintBase = MOBILE and "bouton HUB" or "RightCtrl pour cacher"
+hintLabel = hint
+hint.TextSize = 10
+hint.Text = hintBase .. " - " .. DIAG
 hint.Parent = main
 
 --====================================================
@@ -423,12 +522,157 @@ task.spawn(function()
 end)
 
 --====================================================
--- RACCOURCI
+-- RACCOURCI (PC) + MODE TELEPHONE
 --====================================================
 
 UserInputService.InputBegan:Connect(function(input, processed)
     if input.KeyCode == Enum.KeyCode.RightControl then
         main.Visible = not main.Visible
+    end
+end)
+
+-- Glisser au doigt ou a la souris (Draggable ne marche pas au tactile).
+-- onTap est appele si le doigt n'a presque pas bouge.
+local function makeDraggable(handle, target, onTap)
+    local dragging, startPos, startInput, moved = false, nil, nil, false
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging, moved = true, false
+            startInput = input.Position
+            startPos = target.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType ~= Enum.UserInputType.Touch
+            and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        local delta = input.Position - startInput
+        if delta.Magnitude > 8 then moved = true end
+        if moved then
+            target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+            if not moved and onTap then onTap() end
+        end
+    end)
+end
+
+local toggleBtn = nil
+local lastTouch = os.clock()
+
+if MOBILE then
+    -- panneau plus petit : l'echelle suit la hauteur de l'ecran
+    local camera = workspace.CurrentCamera
+    local viewY = camera and camera.ViewportSize.Y or 400
+    local panelH = 108 + #Scripts * 46
+    local scale = math.clamp((viewY * 0.6) / panelH, 0.4, 0.7)
+    local uiScale = Instance.new("UIScale")
+    uiScale.Scale = scale
+    uiScale.Parent = main
+    -- panneau en haut a droite, juste a gauche de la bulle
+    main.AnchorPoint = Vector2.new(1, 0)
+    main.Position = UDim2.new(1, -64, 0, 10)
+    main.Draggable = false
+    main.Visible = false            -- ferme au demarrage
+    makeDraggable(title, main, nil)
+
+    -- bulle HUB en haut a droite de l'ecran
+    toggleBtn = Instance.new("TextButton")
+    toggleBtn.Name = "HubToggle"
+    toggleBtn.Size = UDim2.new(0, 46, 0, 46)
+    toggleBtn.AnchorPoint = Vector2.new(1, 0)
+    toggleBtn.Position = UDim2.new(1, -8, 0, 10)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(17, 18, 26)
+    toggleBtn.BackgroundTransparency = 0.15
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.AutoButtonColor = false
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.TextSize = 13
+    toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toggleBtn.Text = "HUB"
+    toggleBtn.Parent = gui
+    local tc = Instance.new("UICorner")
+    tc.CornerRadius = UDim.new(1, 0)
+    tc.Parent = toggleBtn
+    local ts = Instance.new("UIStroke")
+    ts.Color = Color3.fromRGB(80, 120, 210)
+    ts.Thickness = 2
+    ts.Parent = toggleBtn
+    makeDraggable(toggleBtn, toggleBtn, function()
+        main.Visible = not main.Visible
+        lastTouch = os.clock()
+    end)
+
+    -- toute action dans le panneau repousse la fermeture auto
+    main.InputBegan:Connect(function() lastTouch = os.clock() end)
+
+    -- fermeture auto apres 30 s sans toucher le panneau
+    task.spawn(function()
+        while _G.HubSession == SESSION do
+            task.wait(1)
+            if AUTO_CLOSE and main.Visible and os.clock() - lastTouch > 30 then
+                main.Visible = false
+            end
+        end
+    end)
+end
+
+-- Ecran de debut / fin du jeu : on FERME le panneau une fois, au moment ou
+-- Start ou Retry apparait, pour qu'il ne recouvre pas le bouton que les
+-- scripts vont cliquer. Le bouton HUB reste toujours la, et tu peux rouvrir
+-- le panneau quand tu veux : il n'est pas referme en boucle.
+-- (v3 le cachait tant que StartBtn "existait" : en donjon ce bouton reste
+-- dans l'interface, invisible a l'ecran, donc le hub disparaissait tout le
+-- donjon et repartait des qu'on le rouvrait.)
+local function reallyOnScreen(b)
+    if not b:IsA("GuiObject") or not b.Visible then return false end
+    local size, pos = b.AbsoluteSize, b.AbsolutePosition
+    if size.X <= 2 or size.Y <= 2 then return false end
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize
+    if vp and (pos.X + size.X < 0 or pos.Y + size.Y < 0
+        or pos.X > vp.X or pos.Y > vp.Y) then
+        return false
+    end
+    local a = b.Parent
+    while a and not a:IsA("PlayerGui") do
+        if (a:IsA("GuiObject") and not a.Visible)
+            or (a:IsA("LayerCollector") and not a.Enabled) then
+            return false
+        end
+        a = a.Parent
+    end
+    return true
+end
+
+local function gameButtonVisible()
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return false end
+    for _, name in ipairs({ "RetryBtn", "StartBtn" }) do
+        local b = pg:FindFirstChild(name, true)
+        if b and reallyOnScreen(b) then return true end
+    end
+    return false
+end
+
+task.spawn(function()
+    local wasBusy = false
+    while _G.HubSession == SESSION do
+        task.wait(0.5)
+        local ok, busy = pcall(gameButtonVisible)
+        busy = ok and busy
+        if AUTO_CLOSE and busy and not wasBusy and main.Visible then
+            main.Visible = false
+            print("[HUB] Start/Retry a l'ecran -> panneau ferme (rouvrable)")
+        end
+        wasBusy = busy
     end
 end)
 
