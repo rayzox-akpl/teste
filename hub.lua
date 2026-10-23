@@ -5,11 +5,11 @@
 -- ==========================================================
 
 -- >>> LA SEULE LIGNE A CHANGER : "pseudo/nom-du-depot" de ton GitHub <<<
-local GITHUB = "rayzox-akpl/teste-tel"
+local GITHUB = "rayzox-akpl/teste"
 local BRANCH = "main"
 local REPO = "https://raw.githubusercontent.com/" .. GITHUB .. "/" .. BRANCH .. "/"
 local HUB_NAME = "Hub"
-local HUB_VERSION = "v3.3"
+local HUB_VERSION = "v3.4"
 -- Le hub ne se ferme JAMAIS tout seul (ni minuterie, ni ecran Start/Retry).
 -- Mets true pour retrouver la fermeture automatique.
 local AUTO_CLOSE = false
@@ -35,39 +35,106 @@ local Scripts = {
 }
 
 --====================================================
--- ETAT PERSISTANT
+-- ETAT PERSISTANT (3 couches, la plus fiable gagne)
+--   1. etat injecte dans le code relance au teleport (aucun fichier)
+--   2. fichier hub_state_v2.json (writefile / readfile)
+--   3. _G (meme serveur uniquement)
 --====================================================
 
--- Persistance par fichier : _G est detruit au changement de serveur
-local STATE_FILE = "hub_state.json"
 local HttpService = game:GetService("HttpService")
+local TeleportPlayer = game:GetService("Players").LocalPlayer
+
+-- Relance apres teleport : queue_on_teleport nous rappelle avec
+-- _G.HubBoot (l'etat), _G.HubFromTeleport et _G.HubBootStamp.
+local BOOT = _G.HubBoot
+local FROM_TP = _G.HubFromTeleport
+local STAMP = _G.HubBootStamp
+_G.HubBoot, _G.HubFromTeleport, _G.HubBootStamp = nil, nil, nil
+
+if FROM_TP then
+    if _G.HubLoadedJob == game.JobId then
+        -- Un hub tourne deja dans ce serveur : on FUSIONNE l'etat recu
+        -- (si plus recent) au lieu de reconstruire une 2e interface.
+        if (STAMP or 0) > (_G.HubBootStamp2 or 0) then
+            _G.HubBootStamp2 = STAMP or 0
+            if _G.HubMerge then
+                pcall(_G.HubMerge, BOOT)
+            else
+                _G.HubPendingBoot = BOOT   -- le hub n'a pas fini de se construire
+            end
+        end
+        return
+    end
+    -- Nouveau serveur : les scripts de l'ancien sont morts
+    _G.HubLaunched = {}
+    _G.HubBootStamp2 = STAMP or 0
+end
+_G.HubLoadedJob = game.JobId
+_G.HubMerge = nil
+
+local STATE_FILES = { "hub_state_v2.json", "hub_state.json" }
+local DIAG = "?"
+local hintLabel, hintBase = nil, ""
+
+local function setDiag(text)
+    DIAG = text
+    if hintLabel then hintLabel.Text = hintBase .. " - " .. DIAG end
+end
+
+local function decodeState(str)
+    if type(str) ~= "string" then return nil end
+    local ok, d = pcall(function() return HttpService:JSONDecode(str) end)
+    if ok and type(d) == "table" and type(d.enabled) == "table" then
+        return d
+    end
+    return nil
+end
 
 local function loadState()
-    if isfile and readfile and isfile(STATE_FILE) then
-        local ok, data = pcall(function()
-            return HttpService:JSONDecode(readfile(STATE_FILE))
-        end)
-        if ok and type(data) == "table" and type(data.enabled) == "table" then
-            return data
+    -- couche 1 : etat injecte au teleport
+    if BOOT then
+        local d = decodeState(BOOT)
+        if d then DIAG = "etat recu (teleport)" return d end
+    end
+    -- couche 2 : fichiers
+    if isfile and readfile then
+        for _, f in ipairs(STATE_FILES) do
+            local ok, content = pcall(function()
+                if isfile(f) then return readfile(f) end
+            end)
+            if ok and content then
+                local d = decodeState(content)
+                if d then DIAG = "etat lu (fichier)" return d end
+            end
         end
     end
+    DIAG = "aucun etat sauvegarde"
     return { enabled = {} }
 end
 
 local function saveState(state)
-    if writefile then
-        pcall(function()
-            writefile(STATE_FILE, HttpService:JSONEncode({ enabled = state.enabled }))
-        end)
+    _G.HubState = state
+    if not writefile then
+        setDiag("pas de writefile (teleport seul)")
+        return
     end
+    local ok, err = pcall(function()
+        writefile(STATE_FILES[1], HttpService:JSONEncode({ enabled = state.enabled }))
+    end)
+    setDiag(ok and "sauvegarde OK" or ("erreur fichier: " .. tostring(err)))
 end
 
-_G.HubState = _G.HubState or loadState()
+-- BOOT gagne toujours (sinon un _G perime d'un ancien serveur pourrait
+-- ecraser l'etat). Sans BOOT : _G, puis fichier.
+_G.HubState = (BOOT and loadState()) or _G.HubState or loadState()
 local State = _G.HubState
 
 -- Scripts deja lances dans CETTE session (survit au retry, pas au teleport)
 _G.HubLaunched = _G.HubLaunched or {}
 local Launched = _G.HubLaunched
+
+-- On remet le fichier a jour des le demarrage (migration + verification)
+saveState(State)
 
 if _G.HubGui then
     pcall(function() _G.HubGui:Destroy() end)
@@ -79,13 +146,35 @@ _G.HubSession = (_G.HubSession or 0) + 1
 local SESSION = _G.HubSession
 print("[HUB] Session " .. SESSION .. " -- version " .. HUB_VERSION .. ", " .. #Scripts .. " scripts")
 
--- ?v=os.time() : GitHub (et certains executors) gardent l'ancienne
--- version du fichier en cache plusieurs minutes. Avec un numero qui
--- change a chaque fois, on recupere toujours la derniere version poussee.
-if queue_on_teleport then
-    queue_on_teleport('loadstring(game:HttpGet("' .. REPO
-        .. 'hub.lua?v=" .. tostring(os.time())))()')
+-- Relance du hub apres teleport, AVEC l'etat dedans (%q echappe la chaine).
+-- Le numero de version (?v=) evite le cache de GitHub.
+local function queueBoot(why)
+    if not queue_on_teleport then return end
+    local ok, err = pcall(function()
+        local json = HttpService:JSONEncode({ enabled = State.enabled })
+        local code = string.format(
+            '_G.HubBoot = %q; _G.HubFromTeleport = true; _G.HubBootStamp = %.3f; '
+            .. 'loadstring(game:HttpGet(%q .. tostring(os.time())))()',
+            json, tick(), REPO .. "hub.lua?v=")
+        queue_on_teleport(code)
+    end)
+    print("[HUB] queue_on_teleport (" .. why .. ") : " .. (ok and "ok" or tostring(err)))
 end
+
+-- Filet de securite si le teleport n'annonce rien
+if _G.HubStartQueued ~= game.JobId then
+    _G.HubStartQueued = game.JobId
+    queueBoot("demarrage")
+end
+
+-- Au moment du teleport : on met en file l'etat LE PLUS RECENT
+local teleportQueued = false
+TeleportPlayer.OnTeleport:Connect(function(tpState)
+    if tpState == Enum.TeleportState.Failed then return end
+    if teleportQueued then return end
+    teleportQueued = true
+    queueBoot("teleport")
+end)
 
 --====================================================
 -- SERVICES
@@ -276,7 +365,10 @@ hint.BackgroundTransparency = 1
 hint.Font = Enum.Font.Gotham
 hint.TextSize = 11
 hint.TextColor3 = Color3.fromRGB(120, 122, 145)
-hint.Text = MOBILE and "bouton HUB pour ouvrir / fermer" or "RightCtrl pour cacher"
+hintBase = MOBILE and "bouton HUB" or "RightCtrl pour cacher"
+hintLabel = hint
+hint.TextSize = 10
+hint.Text = hintBase .. " - " .. DIAG
 hint.Parent = main
 
 --====================================================
@@ -393,6 +485,26 @@ end
 
 for i, entry in ipairs(Scripts) do
     makeToggle(entry, i)
+end
+
+-- Fusion d'un etat recu au teleport dans le hub deja ouvert
+local function mergeBoot(bootJson)
+    local d = decodeState(bootJson)
+    if not d then return end
+    for _, entry in ipairs(Scripts) do
+        local want = d.enabled[entry.name] == true
+        if (State.enabled[entry.name] == true) ~= want and toggleRefs[entry.name] then
+            toggleRefs[entry.name](want, true)
+        end
+    end
+    setDiag("etat recu (teleport)")
+    task.spawn(function() launchMissing("teleport") end)
+end
+_G.HubMerge = mergeBoot
+if _G.HubPendingBoot then
+    local pending = _G.HubPendingBoot
+    _G.HubPendingBoot = nil
+    mergeBoot(pending)
 end
 
 --====================================================
