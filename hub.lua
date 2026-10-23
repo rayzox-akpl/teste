@@ -9,7 +9,7 @@ local GITHUB = "rayzox-akpl/teste"
 local BRANCH = "main"
 local REPO = "https://raw.githubusercontent.com/" .. GITHUB .. "/" .. BRANCH .. "/"
 local HUB_NAME = "Hub"
-local HUB_VERSION = "v3.4"
+local HUB_VERSION = "v3.5"
 -- Le hub ne se ferme JAMAIS tout seul (ni minuterie, ni ecran Start/Retry).
 -- Mets true pour retrouver la fermeture automatique.
 local AUTO_CLOSE = false
@@ -55,6 +55,7 @@ if FROM_TP then
     if _G.HubLoadedJob == game.JobId then
         -- Un hub tourne deja dans ce serveur : on FUSIONNE l'etat recu
         -- (si plus recent) au lieu de reconstruire une 2e interface.
+        print("[HUB] copie teleport fusionnee (pas de nouvelle interface)")
         if (STAMP or 0) > (_G.HubBootStamp2 or 0) then
             _G.HubBootStamp2 = STAMP or 0
             if _G.HubMerge then
@@ -211,6 +212,12 @@ local function runScript(entry, force)
         return true
     end
 
+    -- RESERVATION IMMEDIATE : HttpGet attend le reseau (le code est
+    -- suspendu). Sans ca, plusieurs lanceurs simultanes (restauration,
+    -- fusion teleport, retry) passent tous le test ci-dessus avant que
+    -- le premier ait fini de telecharger -> script lance 2-3 fois.
+    Launched[entry.name] = true
+
     -- Cache-buster : evite de recuperer une version perimee
     local url = REPO .. entry.file .. "?v=" .. tostring(tick())
 
@@ -219,12 +226,14 @@ local function runScript(entry, force)
     end)
 
     if not ok or not source or #source < 20 then
+        Launched[entry.name] = nil   -- libere la reservation : on pourra reessayer
         warn("[HUB] Telechargement echoue : " .. entry.file)
         return false
     end
 
     local fn, err = loadstring(source)
     if not fn then
+        Launched[entry.name] = nil
         warn("[HUB] Compilation echouee : " .. entry.file .. " -> " .. tostring(err))
         return false
     end
