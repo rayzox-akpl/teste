@@ -3666,8 +3666,8 @@ local SCAN_INTERVAL = 1.0
 local DEEP_SCAN_INTERVAL = 5.0
 local SKIP_SEARCH_WINDOW = 90.0
 local FARM_WAIT_WINDOW = 120.0
-local START_CLICK_DELAY = 2.0
-local RETRY_CLICK_DELAY = 3.0
+local START_CLICK_DELAY = 1.0
+local RETRY_CLICK_DELAY = 1.0
 
 local running = true
 local connections = {}
