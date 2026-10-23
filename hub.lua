@@ -9,7 +9,7 @@ local GITHUB = "rayzox-akpl/teste"
 local BRANCH = "main"
 local REPO = "https://raw.githubusercontent.com/" .. GITHUB .. "/" .. BRANCH .. "/"
 local HUB_NAME = "Hub"
-local HUB_VERSION = "v3.3"
+local HUB_VERSION = "v3.4"
 -- Le hub ne se ferme JAMAIS tout seul (ni minuterie, ni ecran Start/Retry).
 -- Mets true pour retrouver la fermeture automatique.
 local AUTO_CLOSE = false
@@ -52,17 +52,25 @@ local STAMP = _G.HubBootStamp
 _G.HubBoot, _G.HubFromTeleport, _G.HubBootStamp = nil, nil, nil
 
 if FROM_TP then
-    local job = game.JobId
-    if _G.HubBootJob == job then
-        -- Deja charge dans ce serveur : on ne garde que la copie la plus recente
-        if (STAMP or 0) <= (_G.HubBootStamp2 or 0) then return end
-    else
-        -- Nouveau serveur : les scripts de l'ancien sont morts
-        _G.HubLaunched = {}
+    if _G.HubLoadedJob == game.JobId then
+        -- Un hub tourne deja dans ce serveur : on FUSIONNE l'etat recu
+        -- (si plus recent) au lieu de reconstruire une 2e interface.
+        if (STAMP or 0) > (_G.HubBootStamp2 or 0) then
+            _G.HubBootStamp2 = STAMP or 0
+            if _G.HubMerge then
+                pcall(_G.HubMerge, BOOT)
+            else
+                _G.HubPendingBoot = BOOT   -- le hub n'a pas fini de se construire
+            end
+        end
+        return
     end
-    _G.HubBootJob = job
+    -- Nouveau serveur : les scripts de l'ancien sont morts
+    _G.HubLaunched = {}
     _G.HubBootStamp2 = STAMP or 0
 end
+_G.HubLoadedJob = game.JobId
+_G.HubMerge = nil
 
 local STATE_FILES = { "hub_state_v2.json", "hub_state.json" }
 local DIAG = "?"
@@ -477,6 +485,26 @@ end
 
 for i, entry in ipairs(Scripts) do
     makeToggle(entry, i)
+end
+
+-- Fusion d'un etat recu au teleport dans le hub deja ouvert
+local function mergeBoot(bootJson)
+    local d = decodeState(bootJson)
+    if not d then return end
+    for _, entry in ipairs(Scripts) do
+        local want = d.enabled[entry.name] == true
+        if (State.enabled[entry.name] == true) ~= want and toggleRefs[entry.name] then
+            toggleRefs[entry.name](want, true)
+        end
+    end
+    setDiag("etat recu (teleport)")
+    task.spawn(function() launchMissing("teleport") end)
+end
+_G.HubMerge = mergeBoot
+if _G.HubPendingBoot then
+    local pending = _G.HubPendingBoot
+    _G.HubPendingBoot = nil
+    mergeBoot(pending)
 end
 
 --====================================================
