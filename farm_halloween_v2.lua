@@ -5,8 +5,9 @@
 -- En plus : va chercher la cle (Rooms.X.Key, E) puis ouvre la porte
 -- (Rooms.X.KeyHole, E) avant de farmer les mobs.
 -- Attaque (patch oct. 2026, 5 vies) : Crimson Scythe F / R / C / V,
--- element Time (2 puis R), potion W si PV bas, et secours a 2000 studs
--- (soin avec Time) sous 20 % de PV quand il n'y a plus de potion.
+-- element Time (2 puis R), potion (UseHeal) si PV bas.
+-- (le secours a 2000 studs a ete retire le 26/10 : pas sur contre les
+-- boss, le Phantom King ramenait le perso dans l'arene.)
 -- En moins : pas de compteur 10 min + kills.
 -- Hub : interrupteur "Halloween v2", incompatible avec FarmInfinite (meme
 -- deplacement). Lance partout, il attend la carte HalloweenDungeon.
@@ -60,8 +61,8 @@ local Objective = { name = nil, pos = nil }
 -- Mob suivi par le SCRIPT 6, vise par le SCRIPT 1.
 local Combat = { target = nil }
 
--- Secours en cours (SCRIPT 1) : le SCRIPT 6 ne deplace plus le perso.
-local Rescue = { active = false }
+-- info = dernier resultat de potion, affiche dans la barre d'etat.
+local Rescue = { info = "" }
 
 --====================================================
 -- VIE DU JOUEUR (methode de h_kronax : Humanoid.HealthChanged)
@@ -87,6 +88,117 @@ end
 
 if player.Character then task.spawn(watchLife, player.Character) end
 player.CharacterAdded:Connect(watchLife)
+
+--====================================================
+-- JOURNAL (logs/halloween/farm_v2_log.txt, reecrit toutes les 3 s)
+--====================================================
+-- Sert a comprendre ce que fait le farm sans regarder la console :
+-- potions et un etat complet toutes les 5 s.
+local LOG_FILE = "logs/halloween/farm_v2_log.txt"
+local logLines, logDirty, logT0 = {}, false, os.clock()
+
+local function flog(msg)
+    local line = string.format("[%7.1f] %s", os.clock() - logT0, msg)
+    print("[FARM] " .. line)
+    table.insert(logLines, line)
+    if #logLines > 3000 then table.remove(logLines, 1) end
+    logDirty = true
+end
+
+task.spawn(function()
+    while true do
+        task.wait(3)
+        if logDirty and typeof(writefile) == "function" then
+            logDirty = false
+            pcall(function() makefolder("logs") end)
+            pcall(function() makefolder("logs/halloween") end)
+            pcall(function() writefile(LOG_FILE, table.concat(logLines, "\n")) end)
+        end
+    end
+end)
+
+flog("farm Halloween v2 lance | PlaceId " .. game.PlaceId .. " | " .. os.date("%Y-%m-%d %H:%M:%S"))
+
+--====================================================
+-- VOEUX DU MODE JJK (JJKMode.Vows)
+--====================================================
+-- Au debut de chaque etage, le jeu propose 3 voeux pendant 15 s. Pendant
+-- ce temps les touches 1 / 2 / 3 CHOISISSENT un voeu et R le REFUSE : le
+-- farm (1 = faux, 2 = Time, R = attaques) en prenait un au hasard (Glass
+-- Vessel = +40 % de degats subis, Blood Price = -1 % PV/s...).
+-- Desormais : des l'offre, 1 / 2 / 3 / R sont bloques pour le farm, puis
+-- on repond comme un joueur (touche du voeu prefere, sinon R = refuser).
+-- VOW_PREFER : voeux acceptes, par ordre de preference (vide = refuser).
+-- Noms : GlassVessel, Fasting, HeavyChains, BloodPrice, ElementBound,
+-- LastStand, Greed, Restless.
+local VOW_PREFER = {}
+local Vow = { pending = false, untilT = 0 }
+
+local VOW_KEYS = { [Enum.KeyCode.One] = true, [Enum.KeyCode.Two] = true,
+    [Enum.KeyCode.Three] = true, [Enum.KeyCode.R] = true }
+
+local function vowScreen()
+    local pg = player:FindFirstChild("PlayerGui")
+    return pg and pg:FindFirstChild("VowScreen", true)
+end
+
+task.spawn(function()
+    local remote = nil
+    pcall(function()
+        remote = ReplicatedStorage.ReplicatedStorage.SharedModules.Dungeons.MiscData
+            .HalloweenDungeon.JJKMode.Vows:WaitForChild("VowRemote", 60)
+    end)
+    if not remote then
+        flog("VOEUX : VowRemote introuvable (pas de mode JJK ?)")
+        return
+    end
+    remote.OnClientEvent:Connect(function(action, data)
+        if action ~= "offer" or type(data) ~= "table" or type(data.Keys) ~= "table" then
+            if action then flog("VOEUX : message " .. tostring(action)) end
+            return
+        end
+        Vow.pending = true
+        Vow.untilT = os.clock() + (data.Time or 15) + 2
+        flog("VOEUX proposes (etage " .. tostring(data.Floor) .. ") : " .. table.concat(data.Keys, ", "))
+
+        -- choix : premier voeu de VOW_PREFER propose, sinon refus (R)
+        local key, choice = Enum.KeyCode.R, "refus"
+        for _, want in ipairs(VOW_PREFER) do
+            for i, k in ipairs(data.Keys) do
+                if k == want and i <= 3 then
+                    key = ({ Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three })[i]
+                    choice = k
+                end
+            end
+            if choice ~= "refus" then break end
+        end
+
+        task.spawn(function()
+            -- on laisse l'ecran s'ouvrir, puis on appuie comme un joueur
+            local t = os.clock()
+            repeat task.wait(0.2) until vowScreen() or os.clock() - t > 4
+            task.wait(0.6)
+            VirtualInputManager:SendKeyEvent(true, key, false, game)
+            task.wait(0.1)
+            VirtualInputManager:SendKeyEvent(false, key, false, game)
+            task.wait(1)
+            -- l'ecran ne s'est pas ferme : reponse directe par le remote
+            if vowScreen() then
+                pcall(function()
+                    if choice == "refus" then remote:FireServer("refuse")
+                    else remote:FireServer("pick", choice) end
+                end)
+                flog("VOEUX : reponse envoyee par le remote (" .. choice .. ")")
+            end
+            flog("VOEUX : " .. (choice == "refus" and "refuse" or ("choisi " .. choice)))
+            -- touches rendues quand l'ecran est ferme
+            local t2 = os.clock()
+            repeat task.wait(0.3) until not vowScreen() or os.clock() - t2 > 20
+            Vow.pending = false
+        end)
+    end)
+    flog("VOEUX : ecoute du VowRemote (choix : " .. (#VOW_PREFER > 0 and table.concat(VOW_PREFER, " > ") or "refuser") .. ")")
+end)
 
 --====================================================
 -- CLICK BUTTON
@@ -120,17 +232,18 @@ end
 -- SCRIPT 1 - ATTAQUES : CRIMSON SCYTHE + ELEMENT TIME + SOINS
 -- ==========================================================
 -- Slot 1 = Crimson Scythe : F Fleau, R Cyclone d'ombres, C Coup tranchant
--- fantome, V Frenesie des faucilles. Un simple appui suffit.
+-- fantome, V Frenesie des faucilles. Un simple appui suffit. Entre deux
+-- attaques, clic gauche en continu (attaque de base). Les recharges sont
+-- reduites de ElementCooldownMultiplier (buff Time Dilation, ~-23 %) et
+-- chaque attaque est confirmee par l'attribut joueur LastAbilityCast.
 -- Slot 2 = element Time (mode Support) : R = Time Dilation (buff 15 s,
 -- recharge 10 s), F = Phase Rewind (+20 % PV), clic gauche = Temporal
 -- Seam (+4 % PV). Le mode Support soigne aussi 3.5 % PV/s en continu ; le
 -- mode Damage retire 2.5 % PV/s -> alerte si le perso est en Damage.
 -- Soins (seulement 5 vies dans le donjon) :
 --   * PV < POTION_HP et au moins une potion (player.VampyricPotions, 3 max)
---     -> W (+35 % PV) ;
---   * PV < RESCUE_HP et plus de potion -> SECOURS (methode h_kronax) :
---     TP a SAFE_HEIGHT studs au-dessus, flottement, passage sur Time, clic
---     gauche + F jusqu'aux PV max, puis retour a la position de depart.
+--     -> HealingService.RF.UseHeal, comme le jeu (+35 % PV). Le W simule
+--     est ignore par le jeu (journaux du 25/10 : 16 essais, 0 potion).
 task.spawn(function()
 
 local TAP_TIME = 0.1           -- duree d'un appui
@@ -138,11 +251,11 @@ local ATTACK_RANGE = 60        -- Fleau touche jusqu'a ~70 studs autour
 local TIME_EVERY = 15          -- duree du buff Time Dilation (recharge 10 s)
 local POTION_HP = 0.5          -- W sous 50 % de PV
 local POTION_DELAY = 2         -- secondes mini entre deux W
-local RESCUE_HP = 0.2          -- secours sous 20 % de PV sans potion
-local SAFE_HEIGHT = 2000       -- hauteur du secours (comme h_kronax)
-local RESCUE_FULL = 0.99       -- PV a atteindre avant de redescendre
-local RESCUE_TIMEOUT = 90      -- secondes max en l'air
-local CD_MARGIN = 0.3          -- marge ajoutee aux recharges
+
+local CD_MARGIN = 0.2          -- marge ajoutee aux recharges
+local RETRY_DELAY = 0.3        -- attaque refusee (encore en recharge) : on
+                               -- reessaie apres ce delai
+local CAST_CONFIRM = 0.3       -- temps max pour voir LastAbilityCast changer
 
 -- ordre de priorite : C aspire et immobilise, F frappe tout autour 3 fois,
 -- R part vers la souris (on vise le mob), V fonce droit devant (invincible)
@@ -155,6 +268,14 @@ local MOVES = {
 local readyAt = {}
 
 local function pressKey(keyCode, duration)
+    -- offre de voeux en cours : 1 / 2 / 3 / R choisiraient ou refuseraient
+    if VOW_KEYS[keyCode] and (Vow.pending or vowScreen()) then
+        if os.clock() < Vow.untilT or vowScreen() then
+            task.wait(duration or 0.05)
+            return
+        end
+        Vow.pending = false
+    end
     VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
     task.wait(duration or 0.05)
     VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
@@ -208,6 +329,71 @@ local function potions()
 end
 
 local lastPotion, lastTime, lastModeWarn = 0, -math.huge, 0
+local lastState = 0
+
+-- Time Dilation (R de Time) ajoute 3/13 = +0.23 a l'attribut joueur
+-- ElementCooldownMultiplier pendant 15 s (code serveur). Recharge reelle
+-- = recharge de base x (1 - multiplicateur), lue en direct : ~-23 %.
+local function cdFactor()
+    local m = player:GetAttribute("ElementCooldownMultiplier") or 0
+    return math.clamp(1 - m, 0.3, 1)
+end
+
+-- Appuie sur une attaque et regarde si le jeu l'a lancee : l'attribut
+-- joueur LastAbilityCast change a chaque attaque (dump_potion du 25/10).
+-- Sans cet attribut, on considere l'attaque lancee.
+local function castAbility(key)
+    local before = player:GetAttribute("LastAbilityCast")
+    pressKey(key, TAP_TIME)
+    local t = os.clock()
+    while os.clock() - t < CAST_CONFIRM do
+        if player:GetAttribute("LastAbilityCast") ~= before then return true end
+        task.wait(0.03)
+    end
+    return before == nil and player:GetAttribute("LastAbilityCast") == nil
+end
+
+-- Le jeu boit la potion avec HealingService.RF.UseHeal (W simule = ignore,
+-- journaux du 25/10). On l'appelle une fois, comme le jeu, puis on verifie
+-- le compteur ; sinon on retente avec W maintenu.
+local UseHeal = nil
+pcall(function()
+    UseHeal = ReplicatedStorage.ReplicatedStorage.Packages.Knit.Services.HealingService.RF.UseHeal
+end)
+
+-- UseHeal:InvokeServer() peut mettre plus de 10 s a revenir (journal du
+-- 25/10 22:33, contre le Vigil : boucle du farm bloquee, 2 morts). On
+-- l'appelle donc dans une tache a part, sans jamais attendre : le farm
+-- continue d'attaquer pendant ce temps.
+local potionCall = { busy = false, since = 0 }
+
+-- Lance une potion. Renvoie true si l'appel est parti.
+local function drinkPotion()
+    if not UseHeal then
+        Rescue.info = "UseHeal introuvable"
+        flog("UseHeal introuvable : pas de potion possible")
+        return false
+    end
+    if potionCall.busy and os.clock() - potionCall.since < 6 then
+        return false
+    end
+    local before = potions()
+    potionCall.busy, potionCall.since = true, os.clock()
+    flog(string.format("UseHeal envoye | PV %.1f %% | potions %d", Life.ratio * 100, before))
+    task.spawn(function()
+        local t = os.clock()
+        local okCall, res = pcall(function() return UseHeal:InvokeServer() end)
+        -- le compteur peut baisser un peu apres la reponse
+        local t2 = os.clock()
+        while os.clock() - t2 < 2 and potions() >= before do task.wait(0.1) end
+        local ok = potions() < before
+        Rescue.info = ok and string.format("potion bue (%d -> %d)", before, potions()) or "UseHeal sans effet"
+        flog(string.format("  UseHeal revenu en %.1f s | PV %.1f %% | potions %d -> %d | reponse %s %s | %s",
+            t2 - t, Life.ratio * 100, before, potions(), tostring(okCall), tostring(res), Rescue.info))
+        potionCall.busy = false
+    end)
+    return true
+end
 
 -- Time en mode Damage = -2.5 % PV/s : alerte a l'ecran toutes les 30 s
 local function checkTimeMode(char)
@@ -223,73 +409,6 @@ local function checkTimeMode(char)
     end)
 end
 
---====================================================
--- SECOURS (methode h_kronax : TP en l'air + flottement)
---====================================================
-local function stabilize(root)
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.AssemblyAngularVelocity = Vector3.zero
-end
-
-local function startFloat(root)
-    if root:FindFirstChild("SafeFloat") then return end
-    local bv = Instance.new("BodyVelocity")
-    bv.Name = "SafeFloat"
-    bv.Velocity = Vector3.zero
-    bv.MaxForce = Vector3.new(0, math.huge, 0)
-    bv.Parent = root
-end
-
-local function stopFloat(root)
-    local bv = root and root:FindFirstChild("SafeFloat")
-    if bv then bv:Destroy() end
-end
-
-local function rescue(char, hum, root)
-    Rescue.active = true
-    local back = root.CFrame
-    local high = back + Vector3.new(0, SAFE_HEIGHT, 0)
-    print(string.format("[SECOURS] PV %d %% sans potion -> TP a %d studs, soin avec Time",
-        math.floor(Life.ratio * 100), SAFE_HEIGHT))
-
-    root.CFrame = high
-    stabilize(root)
-    startFloat(root)
-    hum:ChangeState(Enum.HumanoidStateType.Physics)
-
-    local deadline = os.clock() + RESCUE_TIMEOUT
-    local lastF = -math.huge
-    while hum.Parent and hum.Health > 0 and Life.ratio < RESCUE_FULL and os.clock() < deadline do
-        -- on reste en haut (le flottement ne bloque que la chute)
-        if (root.Position - high.Position).Magnitude > 50 then
-            root.CFrame = high
-            stabilize(root)
-        end
-        if equip(2) then
-            clickCenter()                        -- Temporal Seam : +4 % PV
-            if os.clock() - lastF > 1 then       -- Phase Rewind : +20 % PV
-                lastF = os.clock()
-                pressKey(Enum.KeyCode.F, TAP_TIME)
-            end
-        end
-        task.wait(0.2)
-    end
-
-    -- retour sur le terrain
-    if hum.Parent and hum.Health > 0 then
-        stopFloat(root)
-        stabilize(root)
-        root.CFrame = back
-        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
-        task.wait(0.1)
-        equip(1)
-        print(string.format("[SECOURS] fini (PV %d %%) -> retour sur le terrain", math.floor(Life.ratio * 100)))
-    else
-        print("[SECOURS] perso mort pendant le secours")
-    end
-    Rescue.active = false
-end
-
 -- Demarrage apres 3 secondes
 task.wait(3)
 equip(1)
@@ -301,31 +420,30 @@ while true do
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     local root = char and char:FindFirstChild("HumanoidRootPart")
 
+    if os.clock() - lastState > 5 then
+        lastState = os.clock()
+        flog(string.format("etat | PV %.1f %% (Life) / %s (Humanoid) | potions %d | ScytheBlood %s | outil %s | recharges x%.2f | objectif %s | cible %s",
+            Life.ratio * 100,
+            hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "?",
+            potions(), tostring(player:GetAttribute("ScytheBlood")), tostring(heldType()),
+            cdFactor(), tostring(Objective.name), Combat.target and Combat.target.Name or "-"))
+    end
+
     if hum and root and hum.Health > 0 then
 
         checkTimeMode(char)
 
-        -- soins : potion si on en a, sinon secours sous RESCUE_HP
-        if Life.ratio < POTION_HP and potions() > 0 then
-            if os.clock() - lastPotion > POTION_DELAY and equip(1) then
-                lastPotion = os.clock()
-                print(string.format("[POTION] PV %d %% -> W (%d potion(s))",
-                    math.floor(Life.ratio * 100), potions()))
-                pressKey(Enum.KeyCode.W, TAP_TIME)
-            end
-        elseif Life.ratio < RESCUE_HP and potions() == 0 then
-            local ok, err = pcall(rescue, char, hum, root)
-            if not ok then
-                warn("[SECOURS] erreur : " .. tostring(err))
-                stopFloat(root)
-                Rescue.active = false
-            end
+        -- soin : potion sous POTION_HP
+        if Life.ratio < POTION_HP and potions() > 0
+            and os.clock() - lastPotion > POTION_DELAY and equip(1) then
+            lastPotion = os.clock()
+            drinkPotion()
         end
 
         -- pas d'attaque pendant la cle / la porte (la Frenesie ferait devier)
         local pos = not Objective.pos and targetPos() or nil
 
-        if not Rescue.active and pos and (pos - root.Position).Magnitude <= ATTACK_RANGE then
+        if pos and (pos - root.Position).Magnitude <= ATTACK_RANGE then
 
             if os.clock() - lastTime >= TIME_EVERY then
                 -- element Time : 2 puis R (Time Dilation), puis retour sur la faux
@@ -337,14 +455,22 @@ while true do
                 end
                 equip(1)
             elseif equip(1) then
+                -- une attaque prete ? sinon clic gauche (attaque de base)
+                local cast = false
                 for _, move in ipairs(MOVES) do
                     if os.clock() >= (readyAt[move.key] or 0) then
                         if move.aim then aimAt(targetPos()) end
-                        pressKey(move.key, TAP_TIME)
-                        readyAt[move.key] = os.clock() + move.cd + CD_MARGIN
-                        task.wait(0.4)
+                        if castAbility(move.key) then
+                            readyAt[move.key] = os.clock() + move.cd * cdFactor() + CD_MARGIN
+                        else
+                            readyAt[move.key] = os.clock() + RETRY_DELAY
+                        end
+                        cast = true
                         break
                     end
+                end
+                if not cast then
+                    clickCenter()
                 end
             end
 
@@ -559,7 +685,8 @@ local rootPart =
 
 local mobToFollow = nil
 
-local TARGET_SPEED = 80
+local TARGET_SPEED = 80         -- vitesse de marche
+local FLY_SPEED = 100           -- vitesse en vol
 
 local flyVelocity = nil
 
@@ -813,7 +940,7 @@ local function updateFly()
 
         flyVelocity.Velocity =
             directionToMob.Unit
-            * 100
+            * FLY_SPEED
 
     else
 
@@ -839,20 +966,6 @@ local function startFarming()
     mainLoopConnection =
         RunService.RenderStepped:Connect(
             function()
-
-                -- secours en l'air : on ne touche pas au perso
-                if Rescue.active then
-
-                    if flyVelocity then
-
-                        flyVelocity:Destroy()
-                        flyVelocity = nil
-
-                    end
-
-                    return
-
-                end
 
                 local closestMob =
                     not Objective.pos
@@ -1074,8 +1187,8 @@ local statusGui = Instance.new("ScreenGui")
 statusGui.Name = "HalloweenFarm"
 statusGui.ResetOnSpawn = false
 local statusLabel = Instance.new("TextLabel")
-statusLabel.Size = UDim2.new(0, 300, 0, 20)
-statusLabel.Position = UDim2.new(0.5, -150, 0, 4)
+statusLabel.Size = UDim2.new(0, 560, 0, 20)
+statusLabel.Position = UDim2.new(0.5, -280, 0, 4)
 statusLabel.BackgroundColor3 = Color3.fromRGB(28, 14, 6)
 statusLabel.BackgroundTransparency = 0.3
 statusLabel.TextColor3 = Color3.fromRGB(255, 170, 60)
@@ -1147,9 +1260,9 @@ while true do
     else
         text = "HALLOWEEN : farm des mobs"
     end
-    if Rescue.active then text = "HALLOWEEN : SECOURS en l'air (soin Time)" end
-    statusLabel.Text = string.format("%s | PV %d %% | potions %d", text,
-        math.floor(Life.ratio * 100 + 0.5), player:GetAttribute("VampyricPotions") or 0)
+    statusLabel.Text = string.format("%s | PV %d %% | potions %d%s", text,
+        math.floor(Life.ratio * 100 + 0.5), player:GetAttribute("VampyricPotions") or 0,
+        Rescue.info ~= "" and (" | " .. Rescue.info) or "")
 
     task.wait(E_DELAY)
 
